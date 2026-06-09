@@ -1,0 +1,20 @@
+[package]
+name = "xiaomiproxy"
+version = "0.1.0"
+edition = "2021"
+description = "Key-injecting reverse proxy for the opencrabs x Xiaomi MiMo collab. Holds the real Xiaomi API key server-side so it never ships in the OpenCrabs binary."
+license = "MIT"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# rustls so the binary has no system OpenSSL dependency — easier to deploy.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

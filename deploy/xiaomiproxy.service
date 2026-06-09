@@ -1,0 +1,28 @@
+[Unit]
+Description=xiaomiproxy — key-injecting proxy for the opencrabs x Xiaomi collab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The Xiaomi key + app token are baked into the binary at build time, so no key
+# file is required here. This optional file (leading '-' = ok if absent) only
+# holds runtime overrides: CUTOFF_DATE, RATE_MAX_PER_MIN, BIND_ADDR, RUST_LOG.
+EnvironmentFile=-/etc/xiaomiproxy.env
+Environment=BIND_ADDR=127.0.0.1:8787
+ExecStart=/usr/local/bin/xiaomiproxy
+Restart=on-failure
+RestartSec=2
+
+# Hardening — this process only needs network + its env file.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
