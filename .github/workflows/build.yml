@@ -1,0 +1,36 @@
+name: build
+
+# Builds the x86_64 Linux release for neuraprod. The Xiaomi key is baked in at
+# compile time from the XIAOMI_MIMO_API_KEY repo secret (build.rs reads it).
+# REPO MUST BE PRIVATE — the artifact contains the baked key.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release (key baked from secret)
+        env:
+          XIAOMI_MIMO_API_KEY: ${{ secrets.XIAOMI_MIMO_API_KEY }}
+          APP_TOKEN: ${{ secrets.APP_TOKEN }}
+        run: |
+          if [ -z "$XIAOMI_MIMO_API_KEY" ]; then
+            echo "::warning::XIAOMI_MIMO_API_KEY secret is not set — the binary will have no baked key"
+          fi
+          cargo build --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaomiproxy-linux-x86_64
+          path: target/release/xiaomiproxy
+          retention-days: 7
+          if-no-files-found: error
