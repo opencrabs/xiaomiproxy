@@ -13,6 +13,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
 
 [profile.release]
 strip = true

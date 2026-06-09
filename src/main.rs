@@ -180,6 +180,13 @@ async fn chat_completions(
     forward(&state, req).await
 }
 
+/// Non-chat models (text-to-speech, speech recognition, voice) — hidden from
+/// the model list so the OpenCrabs picker only offers chat-capable models.
+fn is_chat_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    !(id.contains("tts") || id.contains("asr") || id.contains("voice"))
+}
+
 async fn list_models(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -189,7 +196,48 @@ async fn list_models(
         return rejection;
     }
     let url = format!("{}/v1/models", state.upstream);
-    forward(&state, state.client.get(&url)).await
+    let resp = match state
+        .client
+        .get(&url)
+        .header(header::AUTHORIZATION, format!("Bearer {}", state.mimo_key))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("models upstream error: {e}");
+            return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
+        }
+    };
+    let status = resp.status();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("models read error: {e}");
+            return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
+        }
+    };
+    // Filter to chat models; if the payload isn't the shape we expect, pass it
+    // through untouched rather than dropping anything.
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut v) => {
+            if let Some(arr) = v.get_mut("data").and_then(|d| d.as_array_mut()) {
+                arr.retain(|m| {
+                    m.get("id")
+                        .and_then(|i| i.as_str())
+                        .map(is_chat_model)
+                        .unwrap_or(true)
+                });
+            }
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                v.to_string(),
+            )
+                .into_response()
+        }
+        Err(_) => (status, bytes).into_response(),
+    }
 }
 
 async fn health() -> &'static str {

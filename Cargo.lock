@@ -1707,6 +1707,7 @@ dependencies = [
  "axum",
  "chrono",
  "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
