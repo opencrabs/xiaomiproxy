@@ -16,12 +16,12 @@
 //! free-riding on the proxy, bounded by the rate limit and the 2-week window.
 
 use axum::{
-    Router,
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Router,
 };
 use std::{
     collections::HashMap,
@@ -31,7 +31,7 @@ use std::{
 };
 
 const DEFAULT_UPSTREAM: &str = "https://api.xiaomimimo.com";
-const DEFAULT_CUTOFF: &str = "2026-06-25";
+const DEFAULT_CUTOFF: &str = "2026-06-26";
 
 struct AppState {
     client: reqwest::Client,
@@ -162,6 +162,54 @@ async fn forward(state: &AppState, req: reqwest::RequestBuilder) -> Response {
     }
 }
 
+/// Models that support image/vision input on the Xiaomi API.
+const VISION_MODELS: &[&str] = &["mimo-v2-omni", "mimo-v2.5"];
+const DEFAULT_VISION_MODEL: &str = "mimo-v2-omni";
+
+/// Returns true if the request body contains image_url content in messages.
+fn has_image_input(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|msgs| {
+            msgs.iter().any(|msg| {
+                // content can be a string or an array of content parts
+                match msg.get("content") {
+                    Some(serde_json::Value::Array(parts)) => parts.iter().any(|p| {
+                        p.get("type")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t == "image_url")
+                            .unwrap_or(false)
+                    }),
+                    _ => false,
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// If the request has image input but the requested model doesn't support
+/// vision, swap to the default vision model. Returns (possibly modified) body
+/// and the model name actually sent upstream.
+fn maybe_swap_vision_model(body: &mut serde_json::Value) -> String {
+    let requested = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if has_image_input(body) && !VISION_MODELS.iter().any(|vm| requested == *vm) {
+        tracing::info!(
+            "vision swap: {} -> {} (image input detected)",
+            requested,
+            DEFAULT_VISION_MODEL
+        );
+        body["model"] = serde_json::Value::String(DEFAULT_VISION_MODEL.to_string());
+        DEFAULT_VISION_MODEL.to_string()
+    } else {
+        requested
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -171,12 +219,31 @@ async fn chat_completions(
     if let Some(rejection) = gate(&state, &headers, peer.ip()) {
         return rejection;
     }
+
+    // Parse body to check for image input and maybe swap model.
+    let mut body_json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            // Can't parse — forward raw body as-is and let upstream handle it.
+            let url = format!("{}/v1/chat/completions", state.upstream);
+            let req = state
+                .client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body);
+            return forward(&state, req).await;
+        }
+    };
+
+    let _model_used = maybe_swap_vision_model(&mut body_json);
+    let body_bytes = body_json.to_string();
+
     let url = format!("{}/v1/chat/completions", state.upstream);
     let req = state
         .client
         .post(&url)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(body);
+        .body(body_bytes);
     forward(&state, req).await
 }
 
@@ -250,8 +317,7 @@ async fn health() -> &'static str {
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -356,4 +422,94 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_body(model: &str, content: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 50
+        })
+    }
+
+    #[test]
+    fn text_only_no_swap() {
+        let mut body = make_body("mimo-v2.5-pro", serde_json::json!("hello"));
+        let used = maybe_swap_vision_model(&mut body);
+        assert_eq!(used, "mimo-v2.5-pro");
+        assert_eq!(body["model"], "mimo-v2.5-pro");
+    }
+
+    #[test]
+    fn image_triggers_swap() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        ]);
+        let mut body = make_body("mimo-v2.5-pro", content);
+        let used = maybe_swap_vision_model(&mut body);
+        assert_eq!(used, "mimo-v2-omni");
+        assert_eq!(body["model"], "mimo-v2-omni");
+    }
+
+    #[test]
+    fn vision_model_no_swap() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        ]);
+        let mut body = make_body("mimo-v2-omni", content);
+        let used = maybe_swap_vision_model(&mut body);
+        assert_eq!(used, "mimo-v2-omni");
+        assert_eq!(body["model"], "mimo-v2-omni");
+    }
+
+    #[test]
+    fn v25_model_with_image_no_swap() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+        ]);
+        let mut body = make_body("mimo-v2.5", content);
+        let used = maybe_swap_vision_model(&mut body);
+        assert_eq!(used, "mimo-v2.5");
+        assert_eq!(body["model"], "mimo-v2.5");
+    }
+
+    #[test]
+    fn string_content_no_swap() {
+        let mut body = make_body("mimo-v2.5-pro", serde_json::json!("just text"));
+        let used = maybe_swap_vision_model(&mut body);
+        assert_eq!(used, "mimo-v2.5-pro");
+    }
+
+    #[test]
+    fn has_image_detects_nested() {
+        let body = serde_json::json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]}
+            ]
+        });
+        assert!(has_image_input(&body));
+    }
+
+    #[test]
+    fn has_image_false_for_text() {
+        let body = serde_json::json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        assert!(!has_image_input(&body));
+    }
 }

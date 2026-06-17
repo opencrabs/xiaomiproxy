@@ -4,9 +4,10 @@
 //! into it is fine.
 //!
 //! Two build-time sources, in order:
-//!   1. `.env` at the project root (gitignored) — used for local builds.
-//!   2. A build-time environment variable of the same name — used by CI, where
-//!      the value comes from a GitHub Actions secret on the (private) repo.
+//! 1. `.env` at the project root (gitignored) — used for local builds.
+//! 2. A build-time environment variable of the same name — used by CI, where
+//!    the value comes from a GitHub Actions secret on the (private) repo.
+//!
 //! If neither is present we don't fail; the binary falls back to runtime env
 //! vars (see `bundled_or_runtime` in main).
 
