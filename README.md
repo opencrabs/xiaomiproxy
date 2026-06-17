@@ -20,6 +20,22 @@ OpenCrabs client ──(no key)──▶ nginx (xiaomi-collab.opencrabs.com)
 - `GET  /v1/models` — pass-through, key injected.
 - `GET  /health` — `ok`.
 
+## Vision model routing (built-in)
+
+If a request includes `image_url` content parts and targets a non-vision model
+(like `mimo-v2.5-pro` or `mimo-v2-flash`), the proxy silently swaps the model
+to `mimo-v2-omni` — the vision-capable default. No client-side changes needed.
+
+| Model | Text | Vision |
+|-------|------|--------|
+| `mimo-v2.5-pro` | ✅ | ✅ (auto-routed to `mimo-v2-omni`) |
+| `mimo-v2-flash` | ✅ | ✅ (auto-routed to `mimo-v2-omni`) |
+| `mimo-v2-omni` | ✅ | ✅ (native, no swap) |
+| `mimo-v2.5` | ✅ | ✅ (native, no swap) |
+
+Text-only requests are never touched — only requests containing `image_url`
+blocks in the messages array trigger the swap.
+
 ## Access control (time-boxed free window)
 
 Pragmatic, not cryptographic — an open-source client can't hold an unextractable
