@@ -31,7 +31,7 @@ use std::{
 };
 
 const DEFAULT_UPSTREAM: &str = "https://api.xiaomimimo.com";
-const DEFAULT_CUTOFF: &str = "2026-06-26";
+const DEFAULT_CUTOFF: &str = "2026-06-27";
 
 struct AppState {
     client: reqwest::Client,
