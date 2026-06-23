@@ -1,22 +1,24 @@
 //! xiaomiproxy — key-injecting reverse proxy for the opencrabs x Xiaomi MiMo collab.
 //!
 //! The OpenCrabs binary points `[providers.xiaomi] base_url` at this proxy and
-//! sends NO real key. The proxy holds the real Xiaomi key (env `MIMO_API_KEY`),
+//! sends NO real key. The proxy holds the real Xiaomi key (env `XIAOMI_MIMO_API_KEY`),
 //! injects it server-side, and streams the response back. So the key never ships
 //! in the (open-source) OpenCrabs binary.
 //!
-//! Access control for a time-boxed free window — pragmatic, not cryptographic
-//! (an open-source client can't hold an unextractable secret):
+//! Access control for a time-boxed free window — pragmatic, not cryptographic:
 //!   1. Hard cutoff date (free window ends; returns 410 after).
 //!   2. Optional shared app token (`APP_TOKEN`) the client sends; rotatable.
 //!   3. Optional User-Agent allowlist (`opencrabs`).
 //!   4. Per-IP rate limit.
-//!
-//! The Xiaomi key stays safe under all of these — the worst abuse case is some
-//! free-riding on the proxy, bounded by the rate limit and the 2-week window.
+
+mod guard;
+mod proxy;
+mod rate;
+mod tracker;
+mod vision;
 
 use axum::{
-    body::{Body, Bytes},
+    body::Bytes,
     extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -24,191 +26,26 @@ use axum::{
     Router,
 };
 use std::{
-    collections::HashMap,
-    net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
 };
 
 const DEFAULT_UPSTREAM: &str = "https://api.xiaomimimo.com";
 const DEFAULT_CUTOFF: &str = "2026-06-27";
 
-struct AppState {
+pub struct AppState {
     client: reqwest::Client,
     mimo_key: String,
     app_token: Option<String>,
     require_ua: bool,
     cutoff: chrono::NaiveDate,
     upstream: String,
-    rate: RateLimiter,
+    rate: rate::RateLimiter,
+    pub tracker: tracker::Tracker,
 }
 
-// ── Per-IP fixed-window rate limiter ────────────────────────────────────────
-
-struct RateLimiter {
-    inner: Mutex<HashMap<IpAddr, (Instant, u32)>>,
-    max: u32,
-    window: Duration,
-}
-
-impl RateLimiter {
-    fn new(max: u32, window: Duration) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            max,
-            window,
-        }
-    }
-
-    fn allow(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        let mut map = self.inner.lock().unwrap();
-        // Keep the map from growing unbounded over the window's lifetime.
-        if map.len() > 4096 {
-            map.retain(|_, (start, _)| now.duration_since(*start) <= self.window);
-        }
-        let entry = map.entry(ip).or_insert((now, 0));
-        if now.duration_since(entry.0) > self.window {
-            *entry = (now, 0);
-        }
-        entry.1 += 1;
-        entry.1 <= self.max
-    }
-}
-
-// ── Guards ──────────────────────────────────────────────────────────────────
-
-/// Real client IP — prefer `X-Forwarded-For` (set by the fronting nginx),
-/// fall back to the socket peer.
-fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(peer)
-}
-
-fn auth_ok(headers: &HeaderMap, expected: &str) -> bool {
-    if let Some(v) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-    {
-        if v.strip_prefix("Bearer ").map(str::trim) == Some(expected) {
-            return true;
-        }
-    }
-    headers
-        .get("x-opencrabs-token")
-        .and_then(|h| h.to_str().ok())
-        .map(|v| v.trim() == expected)
-        .unwrap_or(false)
-}
-
-fn ua_ok(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::USER_AGENT)
-        .and_then(|h| h.to_str().ok())
-        .map(|ua| ua.to_ascii_lowercase().contains("opencrabs"))
-        .unwrap_or(false)
-}
-
-/// Runs every gate. Returns `Some(rejection)` to deny, `None` to proceed.
-fn gate(state: &AppState, headers: &HeaderMap, peer: IpAddr) -> Option<Response> {
-    if chrono::Utc::now().date_naive() > state.cutoff {
-        return Some((StatusCode::GONE, "Xiaomi free collab window has ended").into_response());
-    }
-    if let Some(tok) = &state.app_token {
-        if !auth_ok(headers, tok) {
-            return Some(
-                (StatusCode::UNAUTHORIZED, "missing or invalid app token").into_response(),
-            );
-        }
-    }
-    if state.require_ua && !ua_ok(headers) {
-        return Some((StatusCode::FORBIDDEN, "forbidden").into_response());
-    }
-    if !state.rate.allow(client_ip(headers, peer)) {
-        return Some((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response());
-    }
-    None
-}
-
-// ── Forwarding ──────────────────────────────────────────────────────────────
-
-/// Inject the real key and stream the upstream response straight through. The
-/// client's Authorization (empty during the free window) is always replaced.
-async fn forward(state: &AppState, req: reqwest::RequestBuilder) -> Response {
-    let req = req.header(header::AUTHORIZATION, format!("Bearer {}", state.mimo_key));
-    match req.send().await {
-        Ok(r) => {
-            let mut builder = Response::builder().status(r.status());
-            // Preserve content-type (text/event-stream for SSE, else json).
-            for name in [header::CONTENT_TYPE, header::CACHE_CONTROL] {
-                if let Some(v) = r.headers().get(&name) {
-                    builder = builder.header(name, v.clone());
-                }
-            }
-            builder
-                .body(Body::from_stream(r.bytes_stream()))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                })
-        }
-        Err(e) => {
-            tracing::warn!("upstream error: {e}");
-            (StatusCode::BAD_GATEWAY, "upstream error").into_response()
-        }
-    }
-}
-
-/// Models that support image/vision input on the Xiaomi API.
-const VISION_MODELS: &[&str] = &["mimo-v2-omni", "mimo-v2.5"];
-const DEFAULT_VISION_MODEL: &str = "mimo-v2-omni";
-
-/// Returns true if the request body contains image_url content in messages.
-fn has_image_input(body: &serde_json::Value) -> bool {
-    body.get("messages")
-        .and_then(|m| m.as_array())
-        .map(|msgs| {
-            msgs.iter().any(|msg| {
-                // content can be a string or an array of content parts
-                match msg.get("content") {
-                    Some(serde_json::Value::Array(parts)) => parts.iter().any(|p| {
-                        p.get("type")
-                            .and_then(|t| t.as_str())
-                            .map(|t| t == "image_url")
-                            .unwrap_or(false)
-                    }),
-                    _ => false,
-                }
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// If the request has image input but the requested model doesn't support
-/// vision, swap to the default vision model. Returns (possibly modified) body
-/// and the model name actually sent upstream.
-fn maybe_swap_vision_model(body: &mut serde_json::Value) -> String {
-    let requested = body
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if has_image_input(body) && !VISION_MODELS.iter().any(|vm| requested == *vm) {
-        tracing::info!(
-            "vision swap: {} -> {} (image input detected)",
-            requested,
-            DEFAULT_VISION_MODEL
-        );
-        body["model"] = serde_json::Value::String(DEFAULT_VISION_MODEL.to_string());
-        DEFAULT_VISION_MODEL.to_string()
-    } else {
-        requested
-    }
-}
+// ── Route handlers ──────────────────────────────────────────────────────────
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
@@ -216,7 +53,18 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(rejection) = gate(&state, &headers, peer.ip()) {
+    let ip = guard::client_ip(&headers, peer.ip()).to_string();
+
+    if let Some(rejection) = guard::gate(&state, &headers, peer.ip()) {
+        state.tracker.record(tracker::RequestRecord {
+            ip,
+            endpoint: "/v1/chat/completions",
+            model_requested: String::new(),
+            model_used: String::new(),
+            status: rejection.status().as_u16(),
+            latency_ms: 0,
+            vision_swap: false,
+        });
         return rejection;
     }
 
@@ -224,18 +72,33 @@ async fn chat_completions(
     let mut body_json: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
-            // Can't parse — forward raw body as-is and let upstream handle it.
             let url = format!("{}/v1/chat/completions", state.upstream);
             let req = state
                 .client
                 .post(&url)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(body);
-            return forward(&state, req).await;
+            let result = proxy::forward_with_metrics(&state, req).await;
+            state.tracker.record(tracker::RequestRecord {
+                ip,
+                endpoint: "/v1/chat/completions",
+                model_requested: String::new(),
+                model_used: String::new(),
+                status: result.status,
+                latency_ms: result.latency_ms,
+                vision_swap: false,
+            });
+            return result.response;
         }
     };
 
-    let _model_used = maybe_swap_vision_model(&mut body_json);
+    let model_requested = body_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model_used = vision::maybe_swap_vision_model(&mut body_json);
+    let vision_swap = model_requested != model_used;
     let body_bytes = body_json.to_string();
 
     let url = format!("{}/v1/chat/completions", state.upstream);
@@ -244,14 +107,19 @@ async fn chat_completions(
         .post(&url)
         .header(header::CONTENT_TYPE, "application/json")
         .body(body_bytes);
-    forward(&state, req).await
-}
+    let result = proxy::forward_with_metrics(&state, req).await;
 
-/// Non-chat models (text-to-speech, speech recognition, voice) — hidden from
-/// the model list so the OpenCrabs picker only offers chat-capable models.
-fn is_chat_model(id: &str) -> bool {
-    let id = id.to_ascii_lowercase();
-    !(id.contains("tts") || id.contains("asr") || id.contains("voice"))
+    state.tracker.record(tracker::RequestRecord {
+        ip,
+        endpoint: "/v1/chat/completions",
+        model_requested,
+        model_used,
+        status: result.status,
+        latency_ms: result.latency_ms,
+        vision_swap,
+    });
+
+    result.response
 }
 
 async fn list_models(
@@ -259,52 +127,116 @@ async fn list_models(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(rejection) = gate(&state, &headers, peer.ip()) {
+    let ip = guard::client_ip(&headers, peer.ip()).to_string();
+
+    if let Some(rejection) = guard::gate(&state, &headers, peer.ip()) {
+        state.tracker.record(tracker::RequestRecord {
+            ip,
+            endpoint: "/v1/models",
+            model_requested: String::new(),
+            model_used: String::new(),
+            status: rejection.status().as_u16(),
+            latency_ms: 0,
+            vision_swap: false,
+        });
         return rejection;
     }
+
+    let start = std::time::Instant::now();
     let url = format!("{}/v1/models", state.upstream);
     let resp = match state
         .client
         .get(&url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", state.mimo_key))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", state.mimo_key),
+        )
         .send()
         .await
     {
         Ok(r) => r,
         Err(e) => {
+            let latency_ms = start.elapsed().as_millis() as u64;
             tracing::warn!("models upstream error: {e}");
+            state.tracker.record(tracker::RequestRecord {
+                ip,
+                endpoint: "/v1/models",
+                model_requested: String::new(),
+                model_used: String::new(),
+                status: 502,
+                latency_ms,
+                vision_swap: false,
+            });
             return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
         }
     };
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
+            let latency_ms = start.elapsed().as_millis() as u64;
             tracing::warn!("models read error: {e}");
+            state.tracker.record(tracker::RequestRecord {
+                ip,
+                endpoint: "/v1/models",
+                model_requested: String::new(),
+                model_used: String::new(),
+                status: 502,
+                latency_ms,
+                vision_swap: false,
+            });
             return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
         }
     };
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+
     // Filter to chat models; if the payload isn't the shape we expect, pass it
     // through untouched rather than dropping anything.
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+    let response = match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(mut v) => {
             if let Some(arr) = v.get_mut("data").and_then(|d| d.as_array_mut()) {
                 arr.retain(|m| {
                     m.get("id")
                         .and_then(|i| i.as_str())
-                        .map(is_chat_model)
+                        .map(vision::is_chat_model)
                         .unwrap_or(true)
                 });
             }
             (
-                status,
+                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
                 [(header::CONTENT_TYPE, "application/json")],
                 v.to_string(),
             )
                 .into_response()
         }
-        Err(_) => (status, bytes).into_response(),
+        Err(_) => (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), bytes).into_response(),
+    };
+
+    state.tracker.record(tracker::RequestRecord {
+        ip,
+        endpoint: "/v1/models",
+        model_requested: String::new(),
+        model_used: String::new(),
+        status,
+        latency_ms,
+        vision_swap: false,
+    });
+
+    response
+}
+
+async fn stats_endpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(tok) = &state.app_token {
+        if !guard::auth_ok(&headers, tok) {
+            return (StatusCode::UNAUTHORIZED, "missing or invalid app token").into_response();
+        }
     }
+    let stats = state.tracker.stats();
+    axum::Json(stats).into_response()
 }
 
 async fn health() -> &'static str {
@@ -336,6 +268,8 @@ async fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
+    let stats_db =
+        std::env::var("STATS_DB").unwrap_or_else(|_| "./xiaomiproxy.db".to_string());
 
     if app_token.is_none() {
         tracing::warn!(
@@ -353,11 +287,13 @@ async fn main() {
         require_ua,
         cutoff,
         upstream,
-        rate: RateLimiter::new(rate_max, Duration::from_secs(60)),
+        rate: rate::RateLimiter::new(rate_max, Duration::from_secs(60)),
+        tracker: tracker::Tracker::new(&stats_db),
     });
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/stats", get(stats_endpoint))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .with_state(state.clone());
@@ -366,7 +302,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     tracing::info!(
-        "xiaomiproxy listening on {bind} (upstream {}, cutoff {}, rate {rate_max}/min, app_token {})",
+        "xiaomiproxy listening on {bind} (upstream {}, cutoff {}, rate {rate_max}/min, app_token {}, stats {stats_db})",
         state.upstream,
         state.cutoff,
         if state.app_token.is_some() { "on" } else { "off" },
@@ -382,8 +318,7 @@ async fn main() {
 }
 
 /// Prefer the value baked in at build time (from `.env` via build.rs); fall
-/// back to a runtime env var of the same name. `option_env!` needs a literal,
-/// hence the explicit match.
+/// back to a runtime env var of the same name.
 fn bundled_or_runtime(name: &str) -> Option<String> {
     let bundled = match name {
         "XIAOMI_MIMO_API_KEY" => option_env!("XIAOMI_MIMO_API_KEY"),
@@ -422,94 +357,4 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutting down");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_body(model: &str, content: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": 50
-        })
-    }
-
-    #[test]
-    fn text_only_no_swap() {
-        let mut body = make_body("mimo-v2.5-pro", serde_json::json!("hello"));
-        let used = maybe_swap_vision_model(&mut body);
-        assert_eq!(used, "mimo-v2.5-pro");
-        assert_eq!(body["model"], "mimo-v2.5-pro");
-    }
-
-    #[test]
-    fn image_triggers_swap() {
-        let content = serde_json::json!([
-            {"type": "text", "text": "what is this?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
-        ]);
-        let mut body = make_body("mimo-v2.5-pro", content);
-        let used = maybe_swap_vision_model(&mut body);
-        assert_eq!(used, "mimo-v2-omni");
-        assert_eq!(body["model"], "mimo-v2-omni");
-    }
-
-    #[test]
-    fn vision_model_no_swap() {
-        let content = serde_json::json!([
-            {"type": "text", "text": "what is this?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
-        ]);
-        let mut body = make_body("mimo-v2-omni", content);
-        let used = maybe_swap_vision_model(&mut body);
-        assert_eq!(used, "mimo-v2-omni");
-        assert_eq!(body["model"], "mimo-v2-omni");
-    }
-
-    #[test]
-    fn v25_model_with_image_no_swap() {
-        let content = serde_json::json!([
-            {"type": "text", "text": "what is this?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
-        ]);
-        let mut body = make_body("mimo-v2.5", content);
-        let used = maybe_swap_vision_model(&mut body);
-        assert_eq!(used, "mimo-v2.5");
-        assert_eq!(body["model"], "mimo-v2.5");
-    }
-
-    #[test]
-    fn string_content_no_swap() {
-        let mut body = make_body("mimo-v2.5-pro", serde_json::json!("just text"));
-        let used = maybe_swap_vision_model(&mut body);
-        assert_eq!(used, "mimo-v2.5-pro");
-    }
-
-    #[test]
-    fn has_image_detects_nested() {
-        let body = serde_json::json!({
-            "model": "mimo-v2.5-pro",
-            "messages": [
-                {"role": "system", "content": "you are helpful"},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "describe"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
-                ]}
-            ]
-        });
-        assert!(has_image_input(&body));
-    }
-
-    #[test]
-    fn has_image_false_for_text() {
-        let body = serde_json::json!({
-            "model": "mimo-v2.5-pro",
-            "messages": [
-                {"role": "user", "content": "hello"}
-            ]
-        });
-        assert!(!has_image_input(&body));
-    }
 }

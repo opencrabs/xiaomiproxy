@@ -19,6 +19,7 @@ OpenCrabs client ──(no key)──▶ nginx (xiaomi-collab.opencrabs.com)
 - `POST /v1/chat/completions` — streaming pass-through (SSE), key injected.
 - `GET  /v1/models` — pass-through, key injected.
 - `GET  /health` — `ok`.
+- `GET  /stats` — usage stats as JSON (protected by `APP_TOKEN` if set).
 
 ## Vision model routing (built-in)
 
@@ -36,13 +37,40 @@ to `mimo-v2-omni` — the vision-capable default. No client-side changes needed.
 Text-only requests are never touched — only requests containing `image_url`
 blocks in the messages array trigger the swap.
 
+## Usage tracking
+
+Every request is recorded to a local SQLite database (`STATS_DB`, default
+`./xiaomiproxy.db`). The `/stats` endpoint returns aggregated usage as JSON.
+
+**Tracked per request:** IP, endpoint, model (requested + used), status code,
+latency (ms), vision swap flag, timestamp.
+
+**`/stats` response:**
+
+```json
+{
+  "total_requests": 1234,
+  "requests_by_model": {"mimo-v2-omni": 800, "mimo-v2.5-pro": 300, "mimo-v2-flash": 134},
+  "requests_by_endpoint": {"/v1/chat/completions": 1200, "/v1/models": 34},
+  "unique_ips": 45,
+  "vision_swaps": 50,
+  "errors": 10,
+  "avg_latency_ms": 234.5,
+  "hourly": [{"hour": "2026-06-22T10:00", "count": 42}]
+}
+```
+
+Protected by `APP_TOKEN` if set (same auth as the proxy endpoints). Set
+`STATS_DB=/var/lib/xiaomiproxy/stats.db` in production so the DB survives
+binary restarts.
+
 ## Access control (time-boxed free window)
 
 Pragmatic, not cryptographic — an open-source client can't hold an unextractable
 secret. The Xiaomi key stays safe regardless; the worst case is bounded
 free-riding on the proxy.
 
-1. **Cutoff date** — after `CUTOFF_DATE` (default `2026-06-25`, UTC) every call gets `410 Gone`.
+1. **Cutoff date** — after `CUTOFF_DATE` (default `2026-06-27`, UTC) every call gets `410 Gone`.
 2. **App token** — if `APP_TOKEN` is set, clients must send it (`Authorization: Bearer <token>` or `X-OpenCrabs-Token: <token>`). Rotatable.
 3. **User-Agent allowlist** — `REQUIRE_OPENCRABS_UA=true` requires a UA containing `opencrabs`.
 4. **Per-IP rate limit** — `RATE_MAX_PER_MIN` (default 60), keyed off `X-Forwarded-For`.
