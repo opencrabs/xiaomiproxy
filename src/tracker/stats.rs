@@ -14,6 +14,8 @@ pub struct Stats {
     pub total_completion_tokens: u64,
     pub total_tokens: u64,
     pub tokens_by_model: HashMap<String, u64>,
+    pub total_cached_tokens: u64,
+    pub total_reasoning_tokens: u64,
     pub hourly: Vec<HourlyCount>,
 }
 
@@ -94,6 +96,22 @@ impl Stats {
              FROM requests GROUP BY model_used",
         );
 
+        let total_cached_tokens: u64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(cached_tokens), 0) FROM requests",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let total_reasoning_tokens: u64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(reasoning_tokens), 0) FROM requests",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
         let hourly = Self::hourly(db);
 
         Stats {
@@ -108,6 +126,8 @@ impl Stats {
             total_completion_tokens,
             total_tokens,
             tokens_by_model,
+            total_cached_tokens,
+            total_reasoning_tokens,
             hourly,
         }
     }

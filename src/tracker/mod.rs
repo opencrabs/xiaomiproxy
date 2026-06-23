@@ -26,7 +26,9 @@ impl Tracker {
                 vision_swap       INTEGER NOT NULL DEFAULT 0,
                 prompt_tokens     INTEGER,
                 completion_tokens INTEGER,
-                total_tokens      INTEGER
+                total_tokens      INTEGER,
+                cached_tokens     INTEGER,
+                reasoning_tokens  INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_req_ts    ON requests(ts);
             CREATE INDEX IF NOT EXISTS idx_req_model ON requests(model_used);
@@ -41,19 +43,21 @@ impl Tracker {
 
     pub fn record(&self, rec: RequestRecord) {
         let db = self.db.lock().unwrap();
-        let (pt, ct, tt) = match &rec.usage {
+        let (pt, ct, tt, cached, reasoning) = match &rec.usage {
             Some(u) => (
                 Some(u.prompt_tokens as i64),
                 Some(u.completion_tokens as i64),
                 Some(u.total_tokens as i64),
+                Some(u.cached_tokens as i64),
+                Some(u.reasoning_tokens as i64),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None, None),
         };
         if let Err(e) = db.execute(
             "INSERT INTO requests \
              (ip, endpoint, model_requested, model_used, status, latency_ms, vision_swap, \
-              prompt_tokens, completion_tokens, total_tokens) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 rec.ip,
                 rec.endpoint,
@@ -65,6 +69,8 @@ impl Tracker {
                 pt,
                 ct,
                 tt,
+                cached,
+                reasoning,
             ],
         ) {
             tracing::warn!("stats record error: {e}");

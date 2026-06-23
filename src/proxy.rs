@@ -113,10 +113,22 @@ fn extract_usage_sse(body: &[u8]) -> Option<TokenUsage> {
 }
 
 fn parse_usage_value(v: &serde_json::Value) -> Option<TokenUsage> {
+    let cached_tokens = v
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let reasoning_tokens = v
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     Some(TokenUsage {
         prompt_tokens: v.get("prompt_tokens")?.as_u64()?,
         completion_tokens: v.get("completion_tokens")?.as_u64()?,
         total_tokens: v.get("total_tokens")?.as_u64()?,
+        cached_tokens,
+        reasoning_tokens,
     })
 }
 
@@ -132,22 +144,28 @@ mod tests {
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 20,
-                "total_tokens": 30
+                "total_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 5},
+                "completion_tokens_details": {"reasoning_tokens": 8}
             }
         });
         let usage = extract_usage(body.to_string().as_bytes()).unwrap();
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 20);
         assert_eq!(usage.total_tokens, 30);
+        assert_eq!(usage.cached_tokens, 5);
+        assert_eq!(usage.reasoning_tokens, 8);
     }
 
     #[test]
     fn extract_usage_from_sse_body() {
-        let body = b"data: {\"id\":\"1\",\"choices\":[]}\n\ndata: {\"id\":\"2\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":15,\"total_tokens\":20}}\n\ndata: [DONE]\n";
+        let body = b"data: {\"id\":\"1\",\"choices\":[]}\n\ndata: {\"id\":\"2\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":15,\"total_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":3},\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\ndata: [DONE]\n";
         let usage = extract_usage(body).unwrap();
         assert_eq!(usage.prompt_tokens, 5);
         assert_eq!(usage.completion_tokens, 15);
         assert_eq!(usage.total_tokens, 20);
+        assert_eq!(usage.cached_tokens, 3);
+        assert_eq!(usage.reasoning_tokens, 7);
     }
 
     #[test]
