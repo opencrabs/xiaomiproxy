@@ -64,6 +64,7 @@ async fn chat_completions(
             status: rejection.status().as_u16(),
             latency_ms: 0,
             vision_swap: false,
+            usage: None,
         });
         return rejection;
     }
@@ -87,6 +88,7 @@ async fn chat_completions(
                 status: result.status,
                 latency_ms: result.latency_ms,
                 vision_swap: false,
+                usage: result.usage,
             });
             return result.response;
         }
@@ -99,6 +101,10 @@ async fn chat_completions(
         .to_string();
     let model_used = vision::maybe_swap_vision_model(&mut body_json);
     let vision_swap = model_requested != model_used;
+
+    // Ensure upstream includes token usage in the response (streaming or not).
+    body_json["stream_options"] = serde_json::json!({"include_usage": true});
+
     let body_bytes = body_json.to_string();
 
     let url = format!("{}/v1/chat/completions", state.upstream);
@@ -117,6 +123,7 @@ async fn chat_completions(
         status: result.status,
         latency_ms: result.latency_ms,
         vision_swap,
+        usage: result.usage,
     });
 
     result.response
@@ -138,6 +145,7 @@ async fn list_models(
             status: rejection.status().as_u16(),
             latency_ms: 0,
             vision_swap: false,
+            usage: None,
         });
         return rejection;
     }
@@ -166,6 +174,7 @@ async fn list_models(
                 status: 502,
                 latency_ms,
                 vision_swap: false,
+                usage: None,
             });
             return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
         }
@@ -184,6 +193,7 @@ async fn list_models(
                 status: 502,
                 latency_ms,
                 vision_swap: false,
+                usage: None,
             });
             return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
         }
@@ -221,6 +231,7 @@ async fn list_models(
         status,
         latency_ms,
         vision_swap: false,
+        usage: None,
     });
 
     response

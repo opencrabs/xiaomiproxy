@@ -10,6 +10,10 @@ pub struct Stats {
     pub vision_swaps: u64,
     pub errors: u64,
     pub avg_latency_ms: f64,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tokens: u64,
+    pub tokens_by_model: HashMap<String, u64>,
     pub hourly: Vec<HourlyCount>,
 }
 
@@ -60,6 +64,36 @@ impl Stats {
             )
             .unwrap_or(0.0);
 
+        let total_prompt_tokens: u64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(prompt_tokens), 0) FROM requests",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let total_completion_tokens: u64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(completion_tokens), 0) FROM requests",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let total_tokens: u64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(total_tokens), 0) FROM requests",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let tokens_by_model = Self::group_by(
+            db,
+            "SELECT COALESCE(model_used, 'unknown'), COALESCE(SUM(total_tokens), 0) \
+             FROM requests GROUP BY model_used",
+        );
+
         let hourly = Self::hourly(db);
 
         Stats {
@@ -70,6 +104,10 @@ impl Stats {
             vision_swaps,
             errors,
             avg_latency_ms,
+            total_prompt_tokens,
+            total_completion_tokens,
+            total_tokens,
+            tokens_by_model,
             hourly,
         }
     }

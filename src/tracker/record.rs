@@ -7,4 +7,13 @@ pub struct RequestRecord {
     pub status: u16,
     pub latency_ms: u64,
     pub vision_swap: bool,
+    pub usage: Option<TokenUsage>,
+}
+
+/// Token usage extracted from the upstream response body.
+#[derive(Debug, Clone)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
